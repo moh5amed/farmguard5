@@ -3,17 +3,13 @@
 setuptools>=65.0.0
 wheel>=0.37.0
 
-# Core video processing (compatible versions)
-moviepy>=1.0.3
+# Video processing (ONLY MOVIEPY)
+moviepy==1.0.3
+
+# Audio processing (essential only)
 librosa>=0.10.0
 soundfile>=0.12.0
 numpy>=1.24.0,<2.0.0
-opencv-python>=4.8.0
-
-# Audio processing (memory optimized)
-pydub>=0.25.0
-audioread>=3.0.0
-ffmpeg-python>=0.2.0
 
 # AI and transcription
 openai>=1.0.0,<2.0.0
@@ -30,14 +26,9 @@ python-dotenv>=1.0.0
 
 # Memory optimization (RENDER SPECIFIC)
 psutil>=5.9.0
-memory-profiler>=0.60.0
-
-# Performance monitoring
-prometheus-client>=0.17.0
 
 # Utilities
 requests>=2.31.0
-python-multipart>=0.0.6
 Pillow>=10.0.0
 
 # Environment compatibility
