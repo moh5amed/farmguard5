@@ -55,14 +55,14 @@ REQUEST_SUBMIT_DELAY_JITTER = 0.08  # seconds - reduced jitter
 DEFAULT_AUDIO_SR = 8000  # 8 kHz mono - ultra-fast processing
 DEFAULT_AUDIO_CHANNELS = 1
 SILENCE_THRESHOLD_MEAN_ABS = 0.006  # more aggressive silence detection
-CHUNK_TARGET_SIZE_MB = 0.8  # ultra-small chunks for maximum speed
+CHUNK_TARGET_SIZE_MB = 8.0  # larger chunks for faster uploads
 MAX_CHUNK_DURATION = 30  # maximum 30 seconds per chunk
 MIN_CHUNK_DURATION = 8   # minimum 8 seconds per chunk
 
 # Render optimization constants
 class RenderOptimizedConstants:
-    MAX_WORKERS = 6
-    CHUNK_SIZE_MB = 0.8
+    MAX_WORKERS = 12  # More workers for faster processing
+    CHUNK_SIZE_MB = 8.0  # Larger chunks for faster uploads
     MAX_CHUNK_DURATION = 30
 
 # Temporary directory for chunked uploads
