@@ -59,6 +59,16 @@ CHUNK_TARGET_SIZE_MB = 0.8  # ultra-small chunks for maximum speed
 MAX_CHUNK_DURATION = 30  # maximum 30 seconds per chunk
 MIN_CHUNK_DURATION = 8   # minimum 8 seconds per chunk
 
+# Render optimization constants
+class RenderOptimizedConstants:
+    MAX_WORKERS = 6
+    CHUNK_SIZE_MB = 0.8
+    MAX_CHUNK_DURATION = 30
+
+# Temporary directory for chunked uploads
+TEMP_DIR = "/tmp" if os.name == 'posix' else os.path.join(os.getcwd(), "temp")
+os.makedirs(TEMP_DIR, exist_ok=True)
+
 class FocusedVideoClipper:
     """Focused video clipper with AI-powered content selection"""
     
@@ -1449,14 +1459,21 @@ def health_check():
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
         return response
     
-    # Get memory information
-    memory_info = video_clipper.memory_manager.get_memory_info()
+    # Get memory information (simple fallback)
+    try:
+        import psutil
+        memory_info = psutil.virtual_memory()
+        memory_usage_mb = round(memory_info.used / (1024 * 1024), 2)
+        memory_percent = round(memory_info.percent, 1)
+    except ImportError:
+        memory_usage_mb = 0
+        memory_percent = 0
     
     return jsonify({
         'status': 'healthy',
         'service': 'Focused Video Clipper (Render Optimized)',
-        'memory_usage_mb': memory_info['rss_mb'],
-        'memory_percent': memory_info['percent'],
+        'memory_usage_mb': memory_usage_mb,
+        'memory_percent': memory_percent,
         'render_optimizations': {
             'chunk_size_mb': CHUNK_TARGET_SIZE_MB,
             'max_workers': RenderOptimizedConstants.MAX_WORKERS,
@@ -1469,13 +1486,186 @@ def health_check():
 @app.route('/health', methods=['GET'])
 def health_check_simple():
     """🚀 RENDER OPTIMIZATION: Simple health check for Render platform"""
-    memory_info = video_clipper.memory_manager.get_memory_info()
+    try:
+        import psutil
+        memory_info = psutil.virtual_memory()
+        memory_usage_mb = round(memory_info.used / (1024 * 1024), 2)
+        memory_percent = round(memory_info.percent, 1)
+    except ImportError:
+        memory_usage_mb = 0
+        memory_percent = 0
+    
     return jsonify({
         'status': 'healthy',
-        'memory_usage_mb': round(memory_info['rss_mb'], 2),
-        'memory_percent': round(memory_info['percent'], 1),
+        'memory_usage_mb': memory_usage_mb,
+        'memory_percent': memory_percent,
         'timestamp': time.time()
     })
+
+@app.route('/api/process-chunk', methods=['POST', 'OPTIONS'])
+def process_chunk():
+    """🚀 SUPER FAST: Process a single video chunk for chunked uploads"""
+    if request.method == 'OPTIONS':
+        response = jsonify({'message': 'Chunk processing preflight successful'})
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return response
+    
+    try:
+        logger.info("🚀 [ChunkedUpload] Processing video chunk...")
+        
+        # Get chunk data
+        chunk = request.files.get('chunk')
+        chunk_id = request.form.get('chunkId')
+        chunk_index = int(request.form.get('chunkIndex', 0))
+        total_chunks = int(request.form.get('totalChunks', 1))
+        is_last_chunk = request.form.get('isLastChunk', 'false').lower() == 'true'
+        project_data = json.loads(request.form.get('projectData', '{}'))
+        
+        if not chunk:
+            return jsonify({'success': False, 'error': 'No chunk provided'}), 400
+        
+        logger.info(f"📦 [ChunkedUpload] Processing chunk {chunk_index + 1}/{total_chunks} (ID: {chunk_id})")
+        
+        # Save chunk temporarily
+        chunk_filename = f"chunk_{chunk_id}_{chunk_index}.tmp"
+        chunk_path = os.path.join(TEMP_DIR, chunk_filename)
+        chunk.save(chunk_path)
+        
+        # Process chunk based on type
+        if is_last_chunk:
+            # Last chunk - combine all chunks and process
+            result = process_combined_chunks(chunk_id, total_chunks, project_data)
+        else:
+            # Regular chunk - just store for later combination
+            result = store_chunk_for_combination(chunk_id, chunk_index, chunk_path)
+        
+        # Clean up temporary chunk file
+        if os.path.exists(chunk_path):
+            os.remove(chunk_path)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"❌ [ChunkedUpload] Error processing chunk: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+def store_chunk_for_combination(chunk_id: str, chunk_index: int, chunk_path: str) -> Dict[str, Any]:
+    """Store chunk for later combination"""
+    try:
+        # Create chunk storage directory
+        chunk_dir = os.path.join(TEMP_DIR, f"chunks_{chunk_id}")
+        os.makedirs(chunk_dir, exist_ok=True)
+        
+        # Move chunk to storage directory
+        stored_chunk_path = os.path.join(chunk_dir, f"chunk_{chunk_index}.tmp")
+        shutil.move(chunk_path, stored_chunk_path)
+        
+        logger.info(f"📦 [ChunkedUpload] Stored chunk {chunk_index} for {chunk_id}")
+        
+        return {
+            'success': True,
+            'message': f'Chunk {chunk_index} stored successfully',
+            'chunkId': chunk_id,
+            'chunkIndex': chunk_index,
+            'stored': True
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ [ChunkedUpload] Error storing chunk: {e}")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+def process_combined_chunks(chunk_id: str, total_chunks: int, project_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Combine all chunks and process the complete video"""
+    try:
+        logger.info(f"🔄 [ChunkedUpload] Combining {total_chunks} chunks for {chunk_id}")
+        
+        # Get chunk storage directory
+        chunk_dir = os.path.join(TEMP_DIR, f"chunks_{chunk_id}")
+        
+        if not os.path.exists(chunk_dir):
+            return {
+                'success': False,
+                'error': 'Chunk storage directory not found'
+            }
+        
+        # Combine chunks into single video file
+        combined_video_path = os.path.join(TEMP_DIR, f"combined_{chunk_id}.mp4")
+        
+        with open(combined_video_path, 'wb') as combined_file:
+            for i in range(total_chunks):
+                chunk_path = os.path.join(chunk_dir, f"chunk_{i}.tmp")
+                if os.path.exists(chunk_path):
+                    with open(chunk_path, 'rb') as chunk_file:
+                        combined_file.write(chunk_file.read())
+                else:
+                    logger.warning(f"⚠️ [ChunkedUpload] Missing chunk {i} for {chunk_id}")
+        
+        logger.info(f"✅ [ChunkedUpload] Combined video created: {combined_video_path}")
+        
+        # Process the combined video directly using the video clipper
+        try:
+            logger.info(f"🎬 [ChunkedUpload] Processing combined video with video clipper...")
+            
+            # Extract project information
+            project_name = project_data.get('projectName', 'Chunked Video')
+            description = project_data.get('description', '')
+            target_platforms = project_data.get('targetPlatforms', ['tiktok'])
+            ai_prompt = project_data.get('aiPrompt', '')
+            processing_options = project_data.get('processingOptions', {})
+            num_clips = project_data.get('numClips', 3)
+            
+            # Process video using the video clipper
+            clips = video_clipper.generate_viral_clips(
+                combined_video_path,
+                num_clips=num_clips,
+                frontend_inputs={
+                    'projectName': project_name,
+                    'description': description,
+                    'targetPlatforms': target_platforms,
+                    'aiPrompt': ai_prompt,
+                    'processingOptions': processing_options
+                }
+            )
+            
+            result = {
+                'success': True,
+                'message': 'Video processed successfully',
+                'project_name': project_name,
+                'clips_generated': len(clips),
+                'clips': clips,
+                'transcription': '',
+                'processing_options': processing_options,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ [ChunkedUpload] Error processing video: {e}")
+            result = {
+                'success': False,
+                'error': str(e)
+            }
+        
+        # Clean up chunk storage
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+        if os.path.exists(combined_video_path):
+            os.remove(combined_video_path)
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ [ChunkedUpload] Error combining chunks: {e}")
+        return {
+            'success': False,
+            'error': str(e)
+        }
 
 @app.route('/api/progress/<task_id>', methods=['GET', 'OPTIONS'])
 def get_progress(task_id):
