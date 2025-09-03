@@ -719,6 +719,9 @@ class FocusedVideoClipper:
         📊 **USER CONTEXT & REQUIREMENTS:**
         {user_instructions}
         
+        📏 **VIDEO DURATION:** {frontend_inputs.get('video_duration', 'Unknown')} seconds
+        ⚠️ **IMPORTANT:** Ensure all clip durations fit within the video length!
+        
         🎯 **PRIMARY MISSION:**
         Extract EXACTLY {num_clips_requested} clips that follow the user's instructions above.
         If user instructions conflict with viral content best practices, USER INSTRUCTIONS WIN.
@@ -1096,6 +1099,13 @@ class FocusedVideoClipper:
             # Load video with MoviePy
             video = VideoFileClip(video_path)
             
+            # Validate duration against actual video length
+            video_duration = video.duration
+            if start_time + duration > video_duration:
+                logger.warning(f"   ⚠️ Requested clip duration ({start_time + duration:.1f}s) exceeds video duration ({video_duration:.1f}s)")
+                duration = max(1, video_duration - start_time)  # Ensure at least 1 second
+                logger.info(f"   🔧 Adjusted duration to: {duration:.1f}s")
+            
             # Extract the clip
             clip = video.subclip(start_time, start_time + duration)
             
@@ -1284,10 +1294,19 @@ class FocusedVideoClipper:
         try:
             logger.info(f"🎬 Starting viral clip generation for: {video_path}")
             
+            # Get video duration for validation
+            video_clip = VideoFileClip(video_path)
+            video_duration = video_clip.duration
+            video_clip.close()
+            logger.info(f"📏 Video duration: {video_duration:.1f} seconds")
+            
             # Extract and analyze audio segments
             viral_segments, full_transcript = self.extract_audio_segments(video_path)
             
             # AI-powered clip selection with captions and hashtags
+            # Add video duration to frontend inputs for AI awareness
+            if frontend_inputs:
+                frontend_inputs['video_duration'] = video_duration
             viral_moments = self.ai_select_best_clips(viral_segments, full_transcript, num_clips, frontend_inputs)
             
             # Generate clips from AI-selected moments
@@ -1771,7 +1790,7 @@ def process_video():
         num_clips = data.get('numClips', 3)
         processing_options = data.get('processingOptions', {})
         
-        # Handle video file
+        # Handle video source
         if source_type == 'file':
             if 'videoFile' not in data:
                 return jsonify({'error': 'Video file required for file upload'}), 400
@@ -1790,6 +1809,29 @@ def process_video():
                 logger.info(f"✅ Video saved: {filepath}")
             else:
                 return jsonify({'error': 'Invalid video file format'}), 400
+        elif source_type in ('cloud', 'drive', 'google-drive'):
+            provider = data.get('provider') or 'google-drive'
+            file_id = data.get('fileId')
+            access_token = data.get('googleAccessToken')
+            if not (provider == 'google-drive' and file_id and access_token):
+                return jsonify({'error': 'Missing provider/fileId/access token for cloud source'}), 400
+            # Download from Google Drive
+            import requests
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            safe_project_name = "".join(c for c in project_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            safe_project_name = safe_project_name.replace(' ', '_')[:30]
+            safe_filename = f"{timestamp}_{safe_project_name}_gdrive.mp4"
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], safe_filename)
+            logger.info(f"🌐 Downloading from Google Drive fileId={file_id} -> {filepath}")
+            with requests.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
+                              headers={'Authorization': f'Bearer {access_token}'},
+                              stream=True, timeout=60) as r:
+                r.raise_for_status()
+                with open(filepath, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=1024*1024):
+                        if chunk:
+                            f.write(chunk)
+            logger.info(f"✅ Video downloaded: {filepath}")
         else:
             return jsonify({'error': f'Unsupported source type: {source_type}'}), 400
         
