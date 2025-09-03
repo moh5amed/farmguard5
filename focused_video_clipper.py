@@ -1448,6 +1448,17 @@ class FocusedVideoClipper:
 # Flask Application
 app = Flask(__name__)
 CORS(app)
+# Ensure CORS headers are present on all responses (including errors)
+@app.after_request
+def add_cors_headers(response):
+    try:
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    except Exception:
+        pass
+    return response
+
 
 # Configuration
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -1784,6 +1795,7 @@ def process_video():
         
         project_name = data['projectName']
         source_type = data['sourceType']
+        logger.info(f"🔎 [API] Parsed fields: project={project_name}, sourceType={source_type}")
         description = data.get('description', '')
         ai_prompt = data.get('aiPrompt', '')
         target_platforms = data.get('targetPlatforms', ['tiktok'])
@@ -1815,6 +1827,7 @@ def process_video():
             access_token = data.get('googleAccessToken')
             if not (provider == 'google-drive' and file_id and access_token):
                 return jsonify({'error': 'Missing provider/fileId/access token for cloud source'}), 400
+            logger.info(f"🌐 [API] Cloud source: provider={provider}, fileId={file_id[:8]}..., token={access_token[:12]}...")
             # Download from Google Drive
             import requests
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1827,10 +1840,15 @@ def process_video():
                               headers={'Authorization': f'Bearer {access_token}'},
                               stream=True, timeout=60) as r:
                 r.raise_for_status()
+                total = int(r.headers.get('Content-Length') or 0)
+                written = 0
                 with open(filepath, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=1024*1024):
                         if chunk:
                             f.write(chunk)
+                            written += len(chunk)
+                            if total:
+                                logger.info(f"⬇️ [API] Download progress: {written/1024/1024:.1f}MB / {total/1024/1024:.1f}MB")
             logger.info(f"✅ Video downloaded: {filepath}")
         else:
             return jsonify({'error': f'Unsupported source type: {source_type}'}), 400
