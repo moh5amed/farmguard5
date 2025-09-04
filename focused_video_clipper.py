@@ -1476,8 +1476,63 @@ processing_status = {
     'current_task': None,
     'progress': 0,
     'message': '',
-    'start_time': None
+    'start_time': None,
+    'last_checkpoint': None,
+    'completed_steps': []
 }
+
+# Progress persistence file
+PROGRESS_FILE = '/tmp/processing_progress.json'
+
+def save_progress():
+    """Save current processing progress to disk"""
+    try:
+        with open(PROGRESS_FILE, 'w') as f:
+            json.dump(processing_status, f, indent=2)
+        logger.info(f"💾 Progress saved: {processing_status['progress']}% - {processing_status['message']}")
+    except Exception as e:
+        logger.error(f"❌ Failed to save progress: {e}")
+
+def load_progress():
+    """Load processing progress from disk"""
+    try:
+        if os.path.exists(PROGRESS_FILE):
+            with open(PROGRESS_FILE, 'r') as f:
+                saved_progress = json.load(f)
+                processing_status.update(saved_progress)
+                logger.info(f"📂 Progress loaded: {processing_status['progress']}% - {processing_status['message']}")
+                return True
+    except Exception as e:
+        logger.error(f"❌ Failed to load progress: {e}")
+    return False
+
+def clear_progress():
+    """Clear saved progress"""
+    try:
+        if os.path.exists(PROGRESS_FILE):
+            os.remove(PROGRESS_FILE)
+        processing_status.update({
+            'is_processing': False,
+            'current_task': None,
+            'progress': 0,
+            'message': '',
+            'start_time': None,
+            'last_checkpoint': None,
+            'completed_steps': []
+        })
+        logger.info("🧹 Progress cleared")
+    except Exception as e:
+        logger.error(f"❌ Failed to clear progress: {e}")
+
+def update_progress(progress: int, message: str, checkpoint: str = None):
+    """Update progress and save to disk"""
+    processing_status['progress'] = progress
+    processing_status['message'] = message
+    if checkpoint:
+        processing_status['last_checkpoint'] = checkpoint
+        if checkpoint not in processing_status['completed_steps']:
+            processing_status['completed_steps'].append(checkpoint)
+    save_progress()
 
 @app.route('/api/health', methods=['GET', 'OPTIONS'])
 def health_check():
@@ -1728,12 +1783,38 @@ def get_status():
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
         return response
     
+    # Load latest progress from disk
+    load_progress()
     return jsonify({
         'is_processing': processing_status['is_processing'],
         'current_task': processing_status['current_task'],
         'progress': processing_status['progress'],
         'message': processing_status['message'],
         'start_time': processing_status['start_time'],
+        'last_checkpoint': processing_status['last_checkpoint'],
+        'completed_steps': processing_status['completed_steps'],
+        'timestamp': datetime.now().isoformat()
+    })
+
+@app.route('/api/progress', methods=['GET', 'OPTIONS'])
+def get_progress():
+    """Get detailed progress information"""
+    if request.method == 'OPTIONS':
+        response = jsonify({'message': 'Progress check preflight successful'})
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return response
+    
+    load_progress()
+    return jsonify({
+        'is_processing': processing_status['is_processing'],
+        'progress': processing_status['progress'],
+        'message': processing_status['message'],
+        'last_checkpoint': processing_status['last_checkpoint'],
+        'completed_steps': processing_status['completed_steps'],
+        'start_time': processing_status['start_time'],
+        'elapsed_time': time.time() - processing_status['start_time'] if processing_status['start_time'] else 0,
         'timestamp': datetime.now().isoformat()
     })
 
@@ -1763,12 +1844,25 @@ def process_video():
         logger.info(f"📊 [API] Request headers: {dict(request.headers)}")
         logger.info("🚀 Processing video request received")
         
+        # Check for existing progress and resume if possible
+        if load_progress() and processing_status['is_processing']:
+            logger.info(f"🔄 [API] Resuming previous processing from {processing_status['last_checkpoint']}")
+            return jsonify({
+                'success': False,
+                'error': 'Video processing already in progress. Please wait for current task to complete.',
+                'progress': processing_status['progress'],
+                'message': processing_status['message']
+            }), 409
+        
         # Set processing status
         processing_status['is_processing'] = True
         processing_status['current_task'] = 'video_processing'
         processing_status['progress'] = 0
         processing_status['message'] = 'Starting video processing...'
         processing_status['start_time'] = time.time()
+        processing_status['last_checkpoint'] = 'start'
+        processing_status['completed_steps'] = []
+        save_progress()
         
         # Handle both JSON and FormData requests
         if request.content_type and 'multipart/form-data' in request.content_type:
@@ -1819,6 +1913,7 @@ def process_video():
                 
                 video_file.save(filepath)
                 logger.info(f"✅ Video saved: {filepath}")
+                update_progress(10, 'Video file uploaded successfully', 'file_uploaded')
             else:
                 return jsonify({'error': 'Invalid video file format'}), 400
         elif source_type in ('cloud', 'drive', 'google-drive'):
@@ -1836,6 +1931,7 @@ def process_video():
             safe_filename = f"{timestamp}_{safe_project_name}_gdrive.mp4"
             filepath = os.path.join(app.config['UPLOAD_FOLDER'], safe_filename)
             logger.info(f"🌐 Downloading from Google Drive fileId={file_id} -> {filepath}")
+            update_progress(5, 'Downloading video from Google Drive...', 'downloading')
             with requests.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
                               headers={'Authorization': f'Bearer {access_token}'},
                               stream=True, timeout=60) as r:
@@ -1848,8 +1944,11 @@ def process_video():
                             f.write(chunk)
                             written += len(chunk)
                             if total:
+                                progress = 5 + int((written / total) * 10)  # 5-15% for download
                                 logger.info(f"⬇️ [API] Download progress: {written/1024/1024:.1f}MB / {total/1024/1024:.1f}MB")
+                                update_progress(progress, f'Downloading video... {written/1024/1024:.1f}MB / {total/1024/1024:.1f}MB', 'downloading')
             logger.info(f"✅ Video downloaded: {filepath}")
+            update_progress(15, 'Video downloaded successfully', 'download_complete')
         else:
             return jsonify({'error': f'Unsupported source type: {source_type}'}), 400
         
@@ -1864,11 +1963,13 @@ def process_video():
         
         # Generate viral clips
         logger.info(f"🎬 Starting clip generation for {num_clips} clips...")
+        update_progress(20, 'Starting video processing...', 'processing_started')
         generated_clips, full_transcript = video_clipper.generate_viral_clips(
             filepath, 
             num_clips=num_clips, 
             frontend_inputs=frontend_inputs
         )
+        update_progress(90, 'Video processing completed', 'processing_complete')
         
         # Prepare response (same format as original)
         response_data = {
@@ -1888,12 +1989,16 @@ def process_video():
             'timestamp': datetime.now().isoformat()
         }
         
+        # Complete processing and clear progress
+        update_progress(100, 'Video processing completed successfully', 'completed')
+        clear_progress()
+        
         logger.info(f"✅ Video processing completed: {len(generated_clips)} clips generated")
         return jsonify(response_data)
         
     except Exception as e:
         logger.error(f"❌ Video processing failed: {e}")
-        processing_status['is_processing'] = False
+        clear_progress()  # Clear progress on error
         return jsonify({
             'success': False,
             'error': str(e),
