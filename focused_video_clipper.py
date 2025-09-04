@@ -1797,7 +1797,7 @@ def get_status():
     })
 
 @app.route('/api/progress', methods=['GET', 'OPTIONS'])
-def get_progress():
+def get_detailed_progress():
     """Get detailed progress information"""
     if request.method == 'OPTIONS':
         response = jsonify({'message': 'Progress check preflight successful'})
