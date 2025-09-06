@@ -20,6 +20,10 @@ import threading
 import subprocess
 import random
 import shutil
+import queue
+import uuid
+from dataclasses import dataclass, asdict
+from enum import Enum
 
 # Flask and request handling
 from flask import Flask, request, jsonify, send_file
@@ -50,24 +54,292 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Request pacing and audio defaults
-REQUEST_SUBMIT_DELAY_BASE = 0.02  # seconds - reduced for speed
-REQUEST_SUBMIT_DELAY_JITTER = 0.08  # seconds - reduced jitter
+REQUEST_SUBMIT_DELAY_BASE = 0.01  # seconds - ultra-fast for speed
+REQUEST_SUBMIT_DELAY_JITTER = 0.04  # seconds - minimal jitter
 DEFAULT_AUDIO_SR = 8000  # 8 kHz mono - ultra-fast processing
 DEFAULT_AUDIO_CHANNELS = 1
 SILENCE_THRESHOLD_MEAN_ABS = 0.006  # more aggressive silence detection
-CHUNK_TARGET_SIZE_MB = 8.0  # larger chunks for faster uploads
+CHUNK_TARGET_SIZE_MB = 4.0  # smaller chunks for faster transcription
 MAX_CHUNK_DURATION = 30  # maximum 30 seconds per chunk
 MIN_CHUNK_DURATION = 8   # minimum 8 seconds per chunk
 
 # Render optimization constants
 class RenderOptimizedConstants:
     MAX_WORKERS = 12  # More workers for faster processing
-    CHUNK_SIZE_MB = 8.0  # Larger chunks for faster uploads
+    CHUNK_SIZE_MB = 4.0  # Smaller chunks for faster transcription
     MAX_CHUNK_DURATION = 30
 
 # Temporary directory for chunked uploads
 TEMP_DIR = "/tmp" if os.name == 'posix' else os.path.join(os.getcwd(), "temp")
 os.makedirs(TEMP_DIR, exist_ok=True)
+
+# Persistent processing system
+class ProcessingStatus(Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+@dataclass
+class ProcessingJob:
+    job_id: str
+    status: ProcessingStatus
+    progress: int
+    message: str
+    start_time: float
+    last_update: float
+    video_path: str
+    project_data: Dict[str, Any]
+    current_step: str
+    completed_steps: List[str]
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+class PersistentProcessingManager:
+    """Persistent processing manager that never resets and survives timeouts"""
+    
+    def __init__(self):
+        self.jobs: Dict[str, ProcessingJob] = {}
+        self.job_queue = queue.Queue()
+        self.worker_thread = None
+        self.is_running = False
+        self.jobs_file = os.path.join(TEMP_DIR, "persistent_jobs.json")
+        self.lock = threading.Lock()
+        
+        # Load existing jobs on startup
+        self.load_jobs()
+        
+        # Start background worker
+        self.start_worker()
+        
+        logger.info("🔄 Persistent Processing Manager initialized")
+    
+    def load_jobs(self):
+        """Load existing jobs from disk"""
+        try:
+            if os.path.exists(self.jobs_file):
+                with open(self.jobs_file, 'r') as f:
+                    jobs_data = json.load(f)
+                    for job_id, job_data in jobs_data.items():
+                        job_data['status'] = ProcessingStatus(job_data['status'])
+                        self.jobs[job_id] = ProcessingJob(**job_data)
+                logger.info(f"📂 Loaded {len(self.jobs)} existing jobs")
+        except Exception as e:
+            logger.error(f"❌ Failed to load jobs: {e}")
+    
+    def save_jobs(self):
+        """Save jobs to disk"""
+        try:
+            with self.lock:
+                jobs_data = {}
+                for job_id, job in self.jobs.items():
+                    jobs_data[job_id] = asdict(job)
+                    jobs_data[job_id]['status'] = job.status.value
+                
+                with open(self.jobs_file, 'w') as f:
+                    json.dump(jobs_data, f, indent=2)
+        except Exception as e:
+            logger.error(f"❌ Failed to save jobs: {e}")
+    
+    def start_worker(self):
+        """Start background worker thread"""
+        if not self.is_running:
+            self.is_running = True
+            self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+            self.worker_thread.start()
+            logger.info("🚀 Background worker started")
+    
+    def _worker_loop(self):
+        """Background worker loop that processes jobs"""
+        while self.is_running:
+            try:
+                # Check for pending jobs
+                pending_jobs = [job for job in self.jobs.values() 
+                              if job.status == ProcessingStatus.PENDING]
+                
+                if pending_jobs:
+                    # Process the oldest pending job
+                    job = min(pending_jobs, key=lambda x: x.start_time)
+                    self._process_job(job)
+                
+                # Save jobs periodically
+                self.save_jobs()
+                
+                # Sleep briefly to avoid busy waiting
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"❌ Worker loop error: {e}")
+                time.sleep(5)
+    
+    def _process_job(self, job: ProcessingJob):
+        """Process a single job"""
+        try:
+            logger.info(f"🎬 Starting job {job.job_id}: {job.project_data.get('projectName', 'Unknown')}")
+            
+            # Update status
+            job.status = ProcessingStatus.IN_PROGRESS
+            job.message = "Starting video processing..."
+            job.progress = 0
+            job.last_update = time.time()
+            self.save_jobs()
+            
+            # Process video using the video clipper
+            video_clipper = FocusedVideoClipper()
+            
+            # Step 1: Extract audio
+            job.current_step = "audio_extraction"
+            job.message = "Extracting audio from video..."
+            job.progress = 10
+            job.last_update = time.time()
+            self.save_jobs()
+            
+            viral_segments, full_transcript = video_clipper.extract_audio_segments(job.video_path)
+            
+            # Step 2: AI clip selection
+            job.current_step = "ai_selection"
+            job.message = "AI selecting best clips..."
+            job.progress = 50
+            job.last_update = time.time()
+            self.save_jobs()
+            
+            num_clips = job.project_data.get('numClips', 3)
+            frontend_inputs = {
+                'projectName': job.project_data.get('projectName', ''),
+                'description': job.project_data.get('description', ''),
+                'aiPrompt': job.project_data.get('aiPrompt', ''),
+                'targetPlatforms': job.project_data.get('targetPlatforms', ['tiktok']),
+                'processingOptions': job.project_data.get('processingOptions', {})
+            }
+            
+            viral_moments = video_clipper.ai_select_best_clips(
+                viral_segments, full_transcript, num_clips, frontend_inputs
+            )
+            
+            # Step 3: Generate clips
+            job.current_step = "clip_generation"
+            job.message = "Generating video clips..."
+            job.progress = 70
+            job.last_update = time.time()
+            self.save_jobs()
+            
+            generated_clips = []
+            for i, moment in enumerate(viral_moments):
+                start_time = moment['start_time']
+                duration = moment['duration']
+                
+                # Create descriptive filename
+                safe_caption = re.sub(r'[^\w\s-]', '', moment['caption'])[:30]
+                clip_name = f"viral_clip_{i+1}_{moment['viral_score']}_{safe_caption}.mp4"
+                clip_name = clip_name.replace(' ', '_')
+                
+                # Extract processing options
+                aspect_ratio_options = None
+                watermark_options = None
+                processing_options = job.project_data.get('processingOptions', {})
+                
+                if processing_options:
+                    if 'targetAspectRatio' in processing_options:
+                        aspect_ratio_options = {
+                            'targetAspectRatio': processing_options.get('targetAspectRatio', '16:9'),
+                            'preserveOriginal': processing_options.get('preserveOriginalAspectRatio', False),
+                            'enableSmartCropping': processing_options.get('enableSmartCropping', True),
+                            'enableLetterboxing': processing_options.get('enableLetterboxing', True)
+                        }
+                    
+                    if 'watermarkOptions' in processing_options:
+                        watermark_options = processing_options['watermarkOptions']
+                
+                clip_path = video_clipper.create_clip(
+                    job.video_path, start_time, duration, clip_name, 
+                    aspect_ratio_options, watermark_options
+                )
+                generated_clips.append(clip_path)
+                
+                # Update progress
+                job.progress = 70 + int((i + 1) / len(viral_moments) * 20)
+                job.message = f"Generated clip {i+1}/{len(viral_moments)}"
+                job.last_update = time.time()
+                self.save_jobs()
+            
+            # Complete job
+            job.status = ProcessingStatus.COMPLETED
+            job.progress = 100
+            job.message = f"Successfully generated {len(generated_clips)} clips"
+            job.current_step = "completed"
+            job.completed_steps = ["audio_extraction", "ai_selection", "clip_generation", "completed"]
+            job.result = {
+                'success': True,
+                'clips_generated': len(generated_clips),
+                'clips': [
+                    {
+                        'filename': os.path.basename(clip_path),
+                        'filepath': clip_path,
+                        'download_url': f'/api/download/{os.path.basename(clip_path)}'
+                    } for clip_path in generated_clips
+                ],
+                'transcription': full_transcript,
+                'processing_options': processing_options
+            }
+            job.last_update = time.time()
+            self.save_jobs()
+            
+            logger.info(f"✅ Job {job.job_id} completed successfully")
+            
+        except Exception as e:
+            logger.error(f"❌ Job {job.job_id} failed: {e}")
+            job.status = ProcessingStatus.FAILED
+            job.error = str(e)
+            job.message = f"Processing failed: {str(e)}"
+            job.last_update = time.time()
+            self.save_jobs()
+    
+    def create_job(self, video_path: str, project_data: Dict[str, Any]) -> str:
+        """Create a new processing job"""
+        job_id = str(uuid.uuid4())
+        job = ProcessingJob(
+            job_id=job_id,
+            status=ProcessingStatus.PENDING,
+            progress=0,
+            message="Job created, waiting to start...",
+            start_time=time.time(),
+            last_update=time.time(),
+            video_path=video_path,
+            project_data=project_data,
+            current_step="pending",
+            completed_steps=[]
+        )
+        
+        with self.lock:
+            self.jobs[job_id] = job
+            self.save_jobs()
+        
+        logger.info(f"📝 Created job {job_id} for {project_data.get('projectName', 'Unknown')}")
+        return job_id
+    
+    def get_job(self, job_id: str) -> Optional[ProcessingJob]:
+        """Get job by ID"""
+        return self.jobs.get(job_id)
+    
+    def get_all_jobs(self) -> Dict[str, ProcessingJob]:
+        """Get all jobs"""
+        return self.jobs.copy()
+    
+    def cancel_job(self, job_id: str) -> bool:
+        """Cancel a job"""
+        if job_id in self.jobs:
+            job = self.jobs[job_id]
+            if job.status in [ProcessingStatus.PENDING, ProcessingStatus.IN_PROGRESS]:
+                job.status = ProcessingStatus.CANCELLED
+                job.message = "Job cancelled by user"
+                job.last_update = time.time()
+                self.save_jobs()
+                return True
+        return False
+
+# Global persistent processing manager
+persistent_manager = PersistentProcessingManager()
 
 class FocusedVideoClipper:
     """Focused video clipper with AI-powered content selection"""
@@ -179,7 +451,7 @@ class FocusedVideoClipper:
     def _transcribe_single_audio_file(self, audio_file_path: str) -> dict:
         """Transcribe a single audio file with Whisper API with timeout and retry logic"""
         max_retries = 3
-        timeout_seconds = 60  # 1 minute timeout per request
+        timeout_seconds = 300  # 5 minute timeout per request for large files
         
         for attempt in range(max_retries):
             try:
@@ -294,7 +566,7 @@ class FocusedVideoClipper:
             
             # Use ThreadPoolExecutor for parallel processing with aggressive concurrency
             # Use more workers for faster processing (API can handle it with our pacing)
-            aggressive_max = min(cpu_count() * 3, 12)  # More aggressive parallelization
+            aggressive_max = min(cpu_count() * 4, 16)  # Even more aggressive parallelization
             max_workers = min(len(audio_chunks), aggressive_max)
             logger.info(f"🔧 Using {max_workers} parallel workers (aggressive parallelization)")
             
@@ -1695,9 +1967,9 @@ def process_combined_chunks(chunk_id: str, total_chunks: int, project_data: Dict
         
         logger.info(f"✅ [ChunkedUpload] Combined video created: {combined_video_path}")
         
-        # Process the combined video directly using the video clipper
+        # Process the combined video using persistent processing system
         try:
-            logger.info(f"🎬 [ChunkedUpload] Processing combined video with video clipper...")
+            logger.info(f"🎬 [ChunkedUpload] Starting persistent processing for combined video...")
             
             # Extract project information
             project_name = project_data.get('projectName', 'Chunked Video')
@@ -1707,26 +1979,26 @@ def process_combined_chunks(chunk_id: str, total_chunks: int, project_data: Dict
             processing_options = project_data.get('processingOptions', {})
             num_clips = project_data.get('numClips', 3)
             
-            # Process video using the video clipper
-            clips = video_clipper.generate_viral_clips(
+            # Create persistent processing job
+            job_id = persistent_manager.create_job(
                 combined_video_path,
-                num_clips=num_clips,
-                frontend_inputs={
+                {
                     'projectName': project_name,
                     'description': description,
                     'targetPlatforms': target_platforms,
                     'aiPrompt': ai_prompt,
-                    'processingOptions': processing_options
+                    'processingOptions': processing_options,
+                    'numClips': num_clips
                 }
             )
             
             result = {
                 'success': True,
-                'message': 'Video processed successfully',
+                'message': 'Video processing started in background - will never reset!',
+                'job_id': job_id,
                 'project_name': project_name,
-                'clips_generated': len(clips),
-                'clips': clips,
-                'transcription': '',
+                'status': 'processing_started',
+                'progress_url': f'/api/job-status/{job_id}',
                 'processing_options': processing_options,
                 'timestamp': datetime.now().isoformat()
             }
@@ -2054,19 +2326,149 @@ def get_analysis(filename):
         logger.error(f"❌ Analysis retrieval failed: {e}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/job-status/<job_id>', methods=['GET', 'OPTIONS'])
+def get_job_status(job_id):
+    """Get status of a persistent processing job"""
+    if request.method == 'OPTIONS':
+        response = jsonify({'message': 'Job status preflight successful'})
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return response
+    
+    try:
+        job = persistent_manager.get_job(job_id)
+        if not job:
+            return jsonify({'error': 'Job not found'}), 404
+        
+        response_data = {
+            'job_id': job.job_id,
+            'status': job.status.value,
+            'progress': job.progress,
+            'message': job.message,
+            'current_step': job.current_step,
+            'completed_steps': job.completed_steps,
+            'start_time': job.start_time,
+            'last_update': job.last_update,
+            'elapsed_time': time.time() - job.start_time,
+            'project_name': job.project_data.get('projectName', 'Unknown'),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        # Add result if completed
+        if job.result:
+            response_data['result'] = job.result
+        
+        # Add error if failed
+        if job.error:
+            response_data['error'] = job.error
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        logger.error(f"❌ Job status retrieval failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/jobs', methods=['GET', 'OPTIONS'])
+def get_all_jobs():
+    """Get all persistent processing jobs"""
+    if request.method == 'OPTIONS':
+        response = jsonify({'message': 'Jobs list preflight successful'})
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return response
+    
+    try:
+        jobs = persistent_manager.get_all_jobs()
+        jobs_data = []
+        
+        for job in jobs.values():
+            job_data = {
+                'job_id': job.job_id,
+                'status': job.status.value,
+                'progress': job.progress,
+                'message': job.message,
+                'current_step': job.current_step,
+                'start_time': job.start_time,
+                'last_update': job.last_update,
+                'elapsed_time': time.time() - job.start_time,
+                'project_name': job.project_data.get('projectName', 'Unknown')
+            }
+            jobs_data.append(job_data)
+        
+        # Sort by start time (newest first)
+        jobs_data.sort(key=lambda x: x['start_time'], reverse=True)
+        
+        return jsonify({
+            'success': True,
+            'jobs': jobs_data,
+            'total_jobs': len(jobs_data),
+            'timestamp': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        logger.error(f"❌ Jobs list retrieval failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/cancel-job/<job_id>', methods=['POST', 'OPTIONS'])
+def cancel_job(job_id):
+    """Cancel a persistent processing job"""
+    if request.method == 'OPTIONS':
+        response = jsonify({'message': 'Cancel job preflight successful'})
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return response
+    
+    try:
+        success = persistent_manager.cancel_job(job_id)
+        if success:
+            return jsonify({
+                'success': True,
+                'message': f'Job {job_id} cancelled successfully',
+                'timestamp': datetime.now().isoformat()
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Job not found or cannot be cancelled'
+            }), 404
+            
+    except Exception as e:
+        logger.error(f"❌ Job cancellation failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/', methods=['GET'])
 def root():
     """Root endpoint"""
     return jsonify({
-        'service': 'Focused Video Clipper Backend',
-        'version': '1.0.0',
+        'service': 'Focused Video Clipper Backend (Persistent Processing)',
+        'version': '2.0.0',
+        'features': [
+            '🔄 Persistent Processing - Never resets, survives timeouts',
+            '📦 Chunked Upload - Direct backend upload in 1MB chunks',
+            '🎬 AI-Powered Clip Generation - Gemini AI selection',
+            '⏱️ Real-time Progress Tracking - Live status updates',
+            '💾 Progress Persistence - Survives server restarts'
+        ],
         'endpoints': [
+            'POST /api/process-chunk - Chunked video upload (NEW)',
+            'GET /api/job-status/<job_id> - Get job status (NEW)',
+            'GET /api/jobs - List all jobs (NEW)',
+            'POST /api/cancel-job/<job_id> - Cancel job (NEW)',
             'POST /api/process-video - Process video and generate clips',
             'GET /api/download/<filename> - Download generated clip',
             'GET /api/transcription/<filename> - Get transcription',
             'GET /api/analysis/<filename> - Get analysis report',
             'GET /api/health - Health check'
-        ]
+        ],
+        'persistent_processing': {
+            'enabled': True,
+            'timeout_immune': True,
+            'auto_resume': True,
+            'progress_persistence': True
+        }
     })
 
 if __name__ == '__main__':
