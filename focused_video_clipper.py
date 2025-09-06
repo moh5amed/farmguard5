@@ -2024,6 +2024,91 @@ def process_combined_chunks(chunk_id: str, total_chunks: int, project_data: Dict
             'error': str(e)
         }
 
+@app.route('/api/process-video', methods=['POST', 'OPTIONS'])
+def process_video_direct():
+    """🎬 DIRECT: Process a complete video file directly (no chunking)"""
+    if request.method == 'OPTIONS':
+        response = jsonify({'message': 'Direct video processing preflight successful'})
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return response
+    
+    try:
+        logger.info("🎬 [DirectUpload] Processing complete video file...")
+        
+        # Get video file and project data
+        video_file = request.files.get('video')
+        project_data = json.loads(request.form.get('projectData', '{}'))
+        
+        if not video_file:
+            return jsonify({'success': False, 'error': 'No video file provided'}), 400
+        
+        logger.info(f"📁 [DirectUpload] Processing video: {video_file.filename}")
+        
+        # Save video file temporarily
+        video_filename = f"direct_upload_{uuid.uuid4().hex}.mp4"
+        video_path = os.path.join(TEMP_DIR, video_filename)
+        video_file.save(video_path)
+        
+        logger.info(f"✅ [DirectUpload] Video saved: {video_path}")
+        
+        # Process the video using persistent processing system
+        try:
+            logger.info(f"🎬 [DirectUpload] Starting persistent processing for direct upload...")
+            
+            # Extract project information
+            project_name = project_data.get('projectName', 'Direct Upload Video')
+            description = project_data.get('description', '')
+            target_platforms = project_data.get('targetPlatforms', ['tiktok'])
+            ai_prompt = project_data.get('aiPrompt', '')
+            processing_options = project_data.get('processingOptions', {})
+            num_clips = project_data.get('numClips', 3)
+            
+            # Create persistent processing job
+            job_id = persistent_manager.create_job(
+                video_path,
+                {
+                    'projectName': project_name,
+                    'description': description,
+                    'targetPlatforms': target_platforms,
+                    'aiPrompt': ai_prompt,
+                    'processingOptions': processing_options,
+                    'numClips': num_clips
+                }
+            )
+            
+            result = {
+                'success': True,
+                'message': 'Video processing started in background - will never reset!',
+                'job_id': job_id,
+                'project_name': project_name,
+                'status': 'processing_started',
+                'progress_url': f'/api/job-status/{job_id}',
+                'processing_options': processing_options,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ [DirectUpload] Error processing video: {e}")
+            result = {
+                'success': False,
+                'error': str(e)
+            }
+        
+        # Clean up video file after processing starts
+        if os.path.exists(video_path):
+            os.remove(video_path)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"❌ [DirectUpload] Error processing direct upload: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
 @app.route('/api/progress/<task_id>', methods=['GET', 'OPTIONS'])
 def get_progress(task_id):
     """Get processing progress for a task"""
