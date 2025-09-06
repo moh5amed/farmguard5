@@ -195,7 +195,14 @@ class PersistentProcessingManager:
             job.last_update = time.time()
             self.save_jobs()
             
+            logger.info(f"🎵 [Job {job.job_id}] Starting audio extraction from: {job.video_path}")
+            logger.info(f"🎵 [Job {job.job_id}] Video file exists: {os.path.exists(job.video_path)}")
+            if os.path.exists(job.video_path):
+                file_size = os.path.getsize(job.video_path)
+                logger.info(f"🎵 [Job {job.job_id}] Video file size: {file_size / (1024*1024):.2f} MB")
+            
             viral_segments, full_transcript = video_clipper.extract_audio_segments(job.video_path)
+            logger.info(f"🎵 [Job {job.job_id}] Audio extraction completed, segments: {len(viral_segments)}")
             
             # Step 2: AI clip selection
             job.current_step = "ai_selection"
@@ -285,6 +292,14 @@ class PersistentProcessingManager:
             job.last_update = time.time()
             self.save_jobs()
             
+            # Clean up the original video file after successful processing
+            try:
+                if os.path.exists(job.video_path):
+                    os.remove(job.video_path)
+                    logger.info(f"🗑️ [Job {job.job_id}] Cleaned up original video file: {job.video_path}")
+            except Exception as cleanup_error:
+                logger.warning(f"⚠️ [Job {job.job_id}] Failed to cleanup video file: {cleanup_error}")
+            
             logger.info(f"✅ Job {job.job_id} completed successfully")
             
         except Exception as e:
@@ -294,6 +309,14 @@ class PersistentProcessingManager:
             job.message = f"Processing failed: {str(e)}"
             job.last_update = time.time()
             self.save_jobs()
+            
+            # Clean up the original video file after failed processing
+            try:
+                if os.path.exists(job.video_path):
+                    os.remove(job.video_path)
+                    logger.info(f"🗑️ [Job {job.job_id}] Cleaned up original video file after failure: {job.video_path}")
+            except Exception as cleanup_error:
+                logger.warning(f"⚠️ [Job {job.job_id}] Failed to cleanup video file after failure: {cleanup_error}")
     
     def create_job(self, video_path: str, project_data: Dict[str, Any]) -> str:
         """Create a new processing job"""
@@ -316,6 +339,10 @@ class PersistentProcessingManager:
             self.save_jobs()
         
         logger.info(f"📝 Created job {job_id} for {project_data.get('projectName', 'Unknown')}")
+        logger.info(f"📝 Job status: {job.status.value}")
+        logger.info(f"📝 Worker running: {self.is_running}")
+        logger.info(f"📝 Total jobs: {len(self.jobs)}")
+        logger.info(f"📝 Pending jobs: {len([j for j in self.jobs.values() if j.status == ProcessingStatus.PENDING])}")
         return job_id
     
     def get_job(self, job_id: str) -> Optional[ProcessingJob]:
@@ -2096,9 +2123,8 @@ def process_video_direct():
                 'error': str(e)
             }
         
-        # Clean up video file after processing starts
-        if os.path.exists(video_path):
-            os.remove(video_path)
+        # Don't clean up video file - let the processing job handle it
+        # The video file will be cleaned up after processing is complete
         
         return jsonify(result)
         
