@@ -379,7 +379,65 @@ class PersistentProcessingManager:
                 return True
         return False
 
-# Persistent processing removed - using direct processing instead
+# Auto-resume functionality for interrupted processing
+def auto_resume_interrupted_processing():
+    """Check for and resume any interrupted processing on server startup"""
+    try:
+        logger.info("🔄 [AutoResume] Checking for interrupted processing...")
+        
+        # Look for processing state files
+        state_files = []
+        if os.path.exists(TEMP_DIR):
+            for file in os.listdir(TEMP_DIR):
+                if file.startswith("processing_state_") and file.endswith(".json"):
+                    state_files.append(os.path.join(TEMP_DIR, file))
+        
+        if not state_files:
+            logger.info("✅ [AutoResume] No interrupted processing found")
+            return
+        
+        logger.info(f"🔍 [AutoResume] Found {len(state_files)} processing state files")
+        
+        for state_file in state_files:
+            try:
+                with open(state_file, 'r') as f:
+                    state = json.load(f)
+                
+                processing_id = state.get('processing_id')
+                status = state.get('status')
+                current_step = state.get('current_step')
+                
+                # Only resume if processing was interrupted (not completed or failed)
+                if status in ['started', 'processing'] and current_step != 'completed':
+                    logger.info(f"🔄 [AutoResume] Resuming interrupted processing: {processing_id}")
+                    logger.info(f"📊 [AutoResume] Status: {status}, Step: {current_step}")
+                    
+                    # Resume processing in a new thread
+                    import threading
+                    resume_thread = threading.Thread(
+                        target=process_video_persistent,
+                        args=(
+                            processing_id,
+                            state.get('video_path'),
+                            state.get('project_data', {}),
+                            state_file
+                        ),
+                        daemon=False
+                    )
+                    resume_thread.start()
+                    
+                    logger.info(f"🚀 [AutoResume] Resumed processing for ID: {processing_id}")
+                else:
+                    logger.info(f"⏭️ [AutoResume] Skipping {processing_id} (status: {status})")
+                    
+            except Exception as e:
+                logger.error(f"❌ [AutoResume] Error processing state file {state_file}: {e}")
+                
+    except Exception as e:
+        logger.error(f"❌ [AutoResume] Error during auto-resume: {e}")
+
+# Run auto-resume on startup
+auto_resume_interrupted_processing()
 
 class FocusedVideoClipper:
     """Focused video clipper with AI-powered content selection"""
@@ -2069,7 +2127,7 @@ def process_combined_chunks(chunk_id: str, total_chunks: int, project_data: Dict
 
 @app.route('/api/process-video', methods=['POST', 'OPTIONS'])
 def process_video_direct():
-    """🎬 DIRECT: Process a complete video file immediately (no background jobs)"""
+    """🎬 DIRECT: Process a complete video file with persistent processing that survives restarts"""
     if request.method == 'OPTIONS':
         response = jsonify({'message': 'Direct video processing preflight successful'})
         response.headers['Access-Control-Allow-Origin'] = '*'
@@ -2078,7 +2136,7 @@ def process_video_direct():
         return response
     
     try:
-        logger.info("🎬 [DirectUpload] Processing complete video file immediately...")
+        logger.info("🎬 [DirectUpload] Processing complete video file with persistent processing...")
         
         # Get video file and project data
         video_file = request.files.get('video')
@@ -2089,133 +2147,282 @@ def process_video_direct():
         
         logger.info(f"📁 [DirectUpload] Processing video: {video_file.filename}")
         
-        # Save video file temporarily
-        video_filename = f"direct_upload_{uuid.uuid4().hex}.mp4"
+        # Generate unique processing ID
+        processing_id = uuid.uuid4().hex
+        video_filename = f"direct_upload_{processing_id}.mp4"
         video_path = os.path.join(TEMP_DIR, video_filename)
-        video_file.save(video_path)
         
+        # Save video file
+        video_file.save(video_path)
         logger.info(f"✅ [DirectUpload] Video saved: {video_path}")
         
-        # Process the video immediately using the video clipper
-        try:
-            logger.info(f"🎬 [DirectUpload] Starting immediate video processing...")
-            
-            # Extract project information
-            project_name = project_data.get('projectName', 'Direct Upload Video')
-            description = project_data.get('description', '')
-            target_platforms = project_data.get('targetPlatforms', ['tiktok'])
-            ai_prompt = project_data.get('aiPrompt', '')
-            processing_options = project_data.get('processingOptions', {})
-            num_clips = project_data.get('numClips', 3)
-            
-            # Create video clipper instance
-            video_clipper = FocusedVideoClipper()
-            
-            # Step 1: Extract audio and get segments
-            logger.info(f"🎵 [DirectUpload] Extracting audio from video...")
-            viral_segments, full_transcript = video_clipper.extract_audio_segments(video_path)
-            logger.info(f"🎵 [DirectUpload] Audio extraction completed, segments: {len(viral_segments)}")
-            
-            # Step 2: AI clip selection
-            logger.info(f"🤖 [DirectUpload] AI selecting best clips...")
-            frontend_inputs = {
-                'projectName': project_name,
-                'description': description,
-                'aiPrompt': ai_prompt,
-                'targetPlatforms': target_platforms,
-                'processingOptions': processing_options
-            }
-            
-            viral_moments = video_clipper.ai_select_best_clips(
-                viral_segments, full_transcript, num_clips, frontend_inputs
-            )
-            logger.info(f"🤖 [DirectUpload] AI selection completed, moments: {len(viral_moments)}")
-            
-            # Step 3: Generate clips
-            logger.info(f"🎥 [DirectUpload] Generating video clips...")
-            generated_clips = []
-            
-            for i, moment in enumerate(viral_moments):
-                start_time = moment['start_time']
-                duration = moment['duration']
-                
-                # Create safe filename
-                safe_caption = re.sub(r'[^\w\s-]', '', moment['caption'])[:30]
-                clip_name = f"viral_clip_{i+1}_{moment['viral_score']}_{safe_caption}.mp4"
-                clip_name = clip_name.replace(' ', '_')
-                
-                # Extract processing options
-                aspect_ratio_options = None
-                watermark_options = None
-                
-                if processing_options:
-                    if 'targetAspectRatio' in processing_options:
-                        aspect_ratio_options = {
-                            'targetAspectRatio': processing_options.get('targetAspectRatio', '16:9'),
-                            'preserveOriginal': processing_options.get('preserveOriginalAspectRatio', False),
-                            'enableSmartCropping': processing_options.get('enableSmartCropping', True),
-                            'enableLetterboxing': processing_options.get('enableLetterboxing', True)
-                        }
-                    
-                    if 'watermarkOptions' in processing_options:
-                        watermark_options = processing_options['watermarkOptions']
-                
-                clip_path = video_clipper.create_clip(
-                    video_path, start_time, duration, clip_name, 
-                    aspect_ratio_options, watermark_options
-                )
-                generated_clips.append(clip_path)
-                logger.info(f"🎥 [DirectUpload] Generated clip {i+1}/{len(viral_moments)}: {clip_name}")
-            
-            # Clean up original video file
-            try:
-                if os.path.exists(video_path):
-                    os.remove(video_path)
-                    logger.info(f"🗑️ [DirectUpload] Cleaned up original video file: {video_path}")
-            except Exception as cleanup_error:
-                logger.warning(f"⚠️ [DirectUpload] Failed to cleanup video file: {cleanup_error}")
-            
-            # Prepare result
-            result = {
-                'success': True,
-                'message': f'Successfully generated {len(generated_clips)} clips',
-                'clips_generated': len(generated_clips),
-                'clips': [
-                    {
-                        'filename': os.path.basename(clip_path),
-                        'filepath': clip_path,
-                        'download_url': f'/api/download/{os.path.basename(clip_path)}'
-                    } for clip_path in generated_clips
-                ],
-                'transcription': full_transcript,
-                'processing_options': processing_options,
-                'project_name': project_name,
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            logger.info(f"✅ [DirectUpload] Video processing completed successfully!")
-            
-        except Exception as e:
-            logger.error(f"❌ [DirectUpload] Error processing video: {e}")
-            # Clean up video file on error
-            try:
-                if os.path.exists(video_path):
-                    os.remove(video_path)
-            except:
-                pass
-            result = {
-                'success': False,
-                'error': str(e)
-            }
+        # Create persistent processing state file
+        state_file = os.path.join(TEMP_DIR, f"processing_state_{processing_id}.json")
+        processing_state = {
+            'processing_id': processing_id,
+            'status': 'started',
+            'video_path': video_path,
+            'project_data': project_data,
+            'current_step': 'audio_extraction',
+            'progress': 0,
+            'start_time': time.time(),
+            'last_update': time.time(),
+            'error': None,
+            'result': None
+        }
         
+        # Save initial state
+        with open(state_file, 'w') as f:
+            json.dump(processing_state, f, indent=2)
+        
+        logger.info(f"💾 [DirectUpload] Created persistent state file: {state_file}")
+        
+        # Start processing in a separate thread that can survive server restarts
+        import threading
+        processing_thread = threading.Thread(
+            target=process_video_persistent,
+            args=(processing_id, video_path, project_data, state_file),
+            daemon=False  # Don't make it a daemon thread so it survives
+        )
+        processing_thread.start()
+        
+        # Return immediately with processing ID for status checking
+        result = {
+            'success': True,
+            'message': 'Video processing started - will never reset!',
+            'processing_id': processing_id,
+            'status_url': f'/api/processing-status/{processing_id}',
+            'project_name': project_data.get('projectName', 'Direct Upload Video'),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        logger.info(f"🚀 [DirectUpload] Processing started with ID: {processing_id}")
         return jsonify(result)
         
     except Exception as e:
-        logger.error(f"❌ [DirectUpload] Error processing direct upload: {e}")
+        logger.error(f"❌ [DirectUpload] Error starting processing: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
+
+def process_video_persistent(processing_id, video_path, project_data, state_file):
+    """Process video with persistent state that survives server restarts"""
+    try:
+        logger.info(f"🎬 [PersistentProcessing] Starting processing for ID: {processing_id}")
+        
+        # Update state: audio extraction
+        update_processing_state(state_file, {
+            'status': 'processing',
+            'current_step': 'audio_extraction',
+            'progress': 10,
+            'last_update': time.time()
+        })
+        
+        # Extract project information
+        project_name = project_data.get('projectName', 'Direct Upload Video')
+        description = project_data.get('description', '')
+        target_platforms = project_data.get('targetPlatforms', ['tiktok'])
+        ai_prompt = project_data.get('aiPrompt', '')
+        processing_options = project_data.get('processingOptions', {})
+        num_clips = project_data.get('numClips', 3)
+        
+        # Create video clipper instance
+        video_clipper = FocusedVideoClipper()
+        
+        # Step 1: Extract audio and get segments
+        logger.info(f"🎵 [PersistentProcessing] Extracting audio from video...")
+        viral_segments, full_transcript = video_clipper.extract_audio_segments(video_path)
+        logger.info(f"🎵 [PersistentProcessing] Audio extraction completed, segments: {len(viral_segments)}")
+        
+        # Update state: AI selection
+        update_processing_state(state_file, {
+            'current_step': 'ai_selection',
+            'progress': 40,
+            'last_update': time.time()
+        })
+        
+        # Step 2: AI clip selection
+        logger.info(f"🤖 [PersistentProcessing] AI selecting best clips...")
+        frontend_inputs = {
+            'projectName': project_name,
+            'description': description,
+            'aiPrompt': ai_prompt,
+            'targetPlatforms': target_platforms,
+            'processingOptions': processing_options
+        }
+        
+        viral_moments = video_clipper.ai_select_best_clips(
+            viral_segments, full_transcript, num_clips, frontend_inputs
+        )
+        logger.info(f"🤖 [PersistentProcessing] AI selection completed, moments: {len(viral_moments)}")
+        
+        # Update state: clip generation
+        update_processing_state(state_file, {
+            'current_step': 'clip_generation',
+            'progress': 60,
+            'last_update': time.time()
+        })
+        
+        # Step 3: Generate clips
+        logger.info(f"🎥 [PersistentProcessing] Generating video clips...")
+        generated_clips = []
+        
+        for i, moment in enumerate(viral_moments):
+            start_time = moment['start_time']
+            duration = moment['duration']
+            
+            # Create safe filename
+            safe_caption = re.sub(r'[^\w\s-]', '', moment['caption'])[:30]
+            clip_name = f"viral_clip_{i+1}_{moment['viral_score']}_{safe_caption}.mp4"
+            clip_name = clip_name.replace(' ', '_')
+            
+            # Extract processing options
+            aspect_ratio_options = None
+            watermark_options = None
+            
+            if processing_options:
+                if 'targetAspectRatio' in processing_options:
+                    aspect_ratio_options = {
+                        'targetAspectRatio': processing_options.get('targetAspectRatio', '16:9'),
+                        'preserveOriginal': processing_options.get('preserveOriginalAspectRatio', False),
+                        'enableSmartCropping': processing_options.get('enableSmartCropping', True),
+                        'enableLetterboxing': processing_options.get('enableLetterboxing', True)
+                    }
+                
+                if 'watermarkOptions' in processing_options:
+                    watermark_options = processing_options['watermarkOptions']
+            
+            clip_path = video_clipper.create_clip(
+                video_path, start_time, duration, clip_name, 
+                aspect_ratio_options, watermark_options
+            )
+            generated_clips.append(clip_path)
+            logger.info(f"🎥 [PersistentProcessing] Generated clip {i+1}/{len(viral_moments)}: {clip_name}")
+            
+            # Update progress
+            progress = 60 + (i + 1) * 30 / len(viral_moments)
+            update_processing_state(state_file, {
+                'progress': min(90, progress),
+                'last_update': time.time()
+            })
+        
+        # Clean up original video file
+        try:
+            if os.path.exists(video_path):
+                os.remove(video_path)
+                logger.info(f"🗑️ [PersistentProcessing] Cleaned up original video file: {video_path}")
+        except Exception as cleanup_error:
+            logger.warning(f"⚠️ [PersistentProcessing] Failed to cleanup video file: {cleanup_error}")
+        
+        # Prepare final result
+        result = {
+            'success': True,
+            'message': f'Successfully generated {len(generated_clips)} clips',
+            'clips_generated': len(generated_clips),
+            'clips': [
+                {
+                    'filename': os.path.basename(clip_path),
+                    'filepath': clip_path,
+                    'download_url': f'/api/download/{os.path.basename(clip_path)}'
+                } for clip_path in generated_clips
+            ],
+            'transcription': full_transcript,
+            'processing_options': processing_options,
+            'project_name': project_name,
+            'processing_time': time.time() - processing_state.get('start_time', time.time())
+        }
+        
+        # Update state: completed
+        update_processing_state(state_file, {
+            'status': 'completed',
+            'current_step': 'completed',
+            'progress': 100,
+            'result': result,
+            'last_update': time.time()
+        })
+        
+        logger.info(f"✅ [PersistentProcessing] Video processing completed successfully for ID: {processing_id}")
+        
+    except Exception as e:
+        logger.error(f"❌ [PersistentProcessing] Error processing video for ID {processing_id}: {e}")
+        
+        # Update state: failed
+        update_processing_state(state_file, {
+            'status': 'failed',
+            'current_step': 'error',
+            'error': str(e),
+            'last_update': time.time()
+        })
+        
+        # Clean up video file on error
+        try:
+            if os.path.exists(video_path):
+                os.remove(video_path)
+        except:
+            pass
+
+def update_processing_state(state_file, updates):
+    """Update the persistent processing state file"""
+    try:
+        if os.path.exists(state_file):
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+            
+            state.update(updates)
+            
+            with open(state_file, 'w') as f:
+                json.dump(state, f, indent=2)
+                
+    except Exception as e:
+        logger.error(f"❌ [PersistentProcessing] Failed to update state: {e}")
+
+@app.route('/api/processing-status/<processing_id>', methods=['GET', 'OPTIONS'])
+def get_processing_status(processing_id):
+    """Get the status of a persistent processing job"""
+    if request.method == 'OPTIONS':
+        response = jsonify({'message': 'Processing status preflight successful'})
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return response
+    
+    try:
+        state_file = os.path.join(TEMP_DIR, f"processing_state_{processing_id}.json")
+        
+        if not os.path.exists(state_file):
+            return jsonify({'error': 'Processing not found'}), 404
+        
+        with open(state_file, 'r') as f:
+            state = json.load(f)
+        
+        # Calculate elapsed time
+        elapsed_time = time.time() - state.get('start_time', time.time())
+        
+        response_data = {
+            'processing_id': processing_id,
+            'status': state.get('status', 'unknown'),
+            'current_step': state.get('current_step', 'unknown'),
+            'progress': state.get('progress', 0),
+            'elapsed_time': elapsed_time,
+            'last_update': state.get('last_update', time.time()),
+            'project_name': state.get('project_data', {}).get('projectName', 'Unknown'),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        # Add result if completed
+        if state.get('result'):
+            response_data['result'] = state['result']
+        
+        # Add error if failed
+        if state.get('error'):
+            response_data['error'] = state['error']
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        logger.error(f"❌ Processing status retrieval failed: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/progress/<task_id>', methods=['GET', 'OPTIONS'])
 def get_progress(task_id):
