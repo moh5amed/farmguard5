@@ -149,19 +149,33 @@ class PersistentProcessingManager:
             self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
             self.worker_thread.start()
             logger.info("🚀 Background worker started")
+            logger.info(f"🚀 Worker thread alive: {self.worker_thread.is_alive()}")
+        else:
+            logger.info("🚀 Background worker already running")
     
     def _worker_loop(self):
         """Background worker loop that processes jobs"""
+        logger.info("🔄 Worker loop started")
+        loop_count = 0
         while self.is_running:
             try:
+                loop_count += 1
+                if loop_count % 10 == 0:  # Log every 10 seconds
+                    logger.info(f"🔄 Worker loop running, iteration {loop_count}")
+                
                 # Check for pending jobs
                 pending_jobs = [job for job in self.jobs.values() 
                               if job.status == ProcessingStatus.PENDING]
                 
                 if pending_jobs:
+                    logger.info(f"🔄 Found {len(pending_jobs)} pending jobs")
                     # Process the oldest pending job
                     job = min(pending_jobs, key=lambda x: x.start_time)
+                    logger.info(f"🔄 Processing job {job.job_id}")
                     self._process_job(job)
+                else:
+                    if loop_count % 30 == 0:  # Log every 30 seconds when no jobs
+                        logger.info(f"🔄 No pending jobs, total jobs: {len(self.jobs)}")
                 
                 # Save jobs periodically
                 self.save_jobs()
@@ -365,8 +379,7 @@ class PersistentProcessingManager:
                 return True
         return False
 
-# Global persistent processing manager
-persistent_manager = PersistentProcessingManager()
+# Persistent processing removed - using direct processing instead
 
 class FocusedVideoClipper:
     """Focused video clipper with AI-powered content selection"""
@@ -1853,11 +1866,14 @@ def health_check():
         memory_usage_mb = 0
         memory_percent = 0
     
+    # Direct processing mode - no background jobs
+    
     return jsonify({
         'status': 'healthy',
         'service': 'Focused Video Clipper (Render Optimized)',
         'memory_usage_mb': memory_usage_mb,
         'memory_percent': memory_percent,
+        'processing_mode': 'direct_immediate',
         'render_optimizations': {
             'chunk_size_mb': CHUNK_TARGET_SIZE_MB,
             'max_workers': RenderOptimizedConstants.MAX_WORKERS,
@@ -2053,7 +2069,7 @@ def process_combined_chunks(chunk_id: str, total_chunks: int, project_data: Dict
 
 @app.route('/api/process-video', methods=['POST', 'OPTIONS'])
 def process_video_direct():
-    """🎬 DIRECT: Process a complete video file directly (no chunking)"""
+    """🎬 DIRECT: Process a complete video file immediately (no background jobs)"""
     if request.method == 'OPTIONS':
         response = jsonify({'message': 'Direct video processing preflight successful'})
         response.headers['Access-Control-Allow-Origin'] = '*'
@@ -2062,7 +2078,7 @@ def process_video_direct():
         return response
     
     try:
-        logger.info("🎬 [DirectUpload] Processing complete video file...")
+        logger.info("🎬 [DirectUpload] Processing complete video file immediately...")
         
         # Get video file and project data
         video_file = request.files.get('video')
@@ -2080,9 +2096,9 @@ def process_video_direct():
         
         logger.info(f"✅ [DirectUpload] Video saved: {video_path}")
         
-        # Process the video using persistent processing system
+        # Process the video immediately using the video clipper
         try:
-            logger.info(f"🎬 [DirectUpload] Starting persistent processing for direct upload...")
+            logger.info(f"🎬 [DirectUpload] Starting immediate video processing...")
             
             # Extract project information
             project_name = project_data.get('projectName', 'Direct Upload Video')
@@ -2092,39 +2108,105 @@ def process_video_direct():
             processing_options = project_data.get('processingOptions', {})
             num_clips = project_data.get('numClips', 3)
             
-            # Create persistent processing job
-            job_id = persistent_manager.create_job(
-                video_path,
-                {
-                    'projectName': project_name,
-                    'description': description,
-                    'targetPlatforms': target_platforms,
-                    'aiPrompt': ai_prompt,
-                    'processingOptions': processing_options,
-                    'numClips': num_clips
-                }
-            )
+            # Create video clipper instance
+            video_clipper = FocusedVideoClipper()
             
+            # Step 1: Extract audio and get segments
+            logger.info(f"🎵 [DirectUpload] Extracting audio from video...")
+            viral_segments, full_transcript = video_clipper.extract_audio_segments(video_path)
+            logger.info(f"🎵 [DirectUpload] Audio extraction completed, segments: {len(viral_segments)}")
+            
+            # Step 2: AI clip selection
+            logger.info(f"🤖 [DirectUpload] AI selecting best clips...")
+            frontend_inputs = {
+                'projectName': project_name,
+                'description': description,
+                'aiPrompt': ai_prompt,
+                'targetPlatforms': target_platforms,
+                'processingOptions': processing_options
+            }
+            
+            viral_moments = video_clipper.ai_select_best_clips(
+                viral_segments, full_transcript, num_clips, frontend_inputs
+            )
+            logger.info(f"🤖 [DirectUpload] AI selection completed, moments: {len(viral_moments)}")
+            
+            # Step 3: Generate clips
+            logger.info(f"🎥 [DirectUpload] Generating video clips...")
+            generated_clips = []
+            
+            for i, moment in enumerate(viral_moments):
+                start_time = moment['start_time']
+                duration = moment['duration']
+                
+                # Create safe filename
+                safe_caption = re.sub(r'[^\w\s-]', '', moment['caption'])[:30]
+                clip_name = f"viral_clip_{i+1}_{moment['viral_score']}_{safe_caption}.mp4"
+                clip_name = clip_name.replace(' ', '_')
+                
+                # Extract processing options
+                aspect_ratio_options = None
+                watermark_options = None
+                
+                if processing_options:
+                    if 'targetAspectRatio' in processing_options:
+                        aspect_ratio_options = {
+                            'targetAspectRatio': processing_options.get('targetAspectRatio', '16:9'),
+                            'preserveOriginal': processing_options.get('preserveOriginalAspectRatio', False),
+                            'enableSmartCropping': processing_options.get('enableSmartCropping', True),
+                            'enableLetterboxing': processing_options.get('enableLetterboxing', True)
+                        }
+                    
+                    if 'watermarkOptions' in processing_options:
+                        watermark_options = processing_options['watermarkOptions']
+                
+                clip_path = video_clipper.create_clip(
+                    video_path, start_time, duration, clip_name, 
+                    aspect_ratio_options, watermark_options
+                )
+                generated_clips.append(clip_path)
+                logger.info(f"🎥 [DirectUpload] Generated clip {i+1}/{len(viral_moments)}: {clip_name}")
+            
+            # Clean up original video file
+            try:
+                if os.path.exists(video_path):
+                    os.remove(video_path)
+                    logger.info(f"🗑️ [DirectUpload] Cleaned up original video file: {video_path}")
+            except Exception as cleanup_error:
+                logger.warning(f"⚠️ [DirectUpload] Failed to cleanup video file: {cleanup_error}")
+            
+            # Prepare result
             result = {
                 'success': True,
-                'message': 'Video processing started in background - will never reset!',
-                'job_id': job_id,
-                'project_name': project_name,
-                'status': 'processing_started',
-                'progress_url': f'/api/job-status/{job_id}',
+                'message': f'Successfully generated {len(generated_clips)} clips',
+                'clips_generated': len(generated_clips),
+                'clips': [
+                    {
+                        'filename': os.path.basename(clip_path),
+                        'filepath': clip_path,
+                        'download_url': f'/api/download/{os.path.basename(clip_path)}'
+                    } for clip_path in generated_clips
+                ],
+                'transcription': full_transcript,
                 'processing_options': processing_options,
+                'project_name': project_name,
                 'timestamp': datetime.now().isoformat()
             }
             
+            logger.info(f"✅ [DirectUpload] Video processing completed successfully!")
+            
         except Exception as e:
             logger.error(f"❌ [DirectUpload] Error processing video: {e}")
+            # Clean up video file on error
+            try:
+                if os.path.exists(video_path):
+                    os.remove(video_path)
+            except:
+                pass
             result = {
                 'success': False,
                 'error': str(e)
             }
-        
-        # Don't clean up video file - let the processing job handle it
-        # The video file will be cleaned up after processing is complete
         
         return jsonify(result)
         
