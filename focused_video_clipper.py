@@ -2315,19 +2315,100 @@ def process_video_persistent(processing_id, video_path, project_data, state_file
         except Exception as cleanup_error:
             logger.warning(f"⚠️ [PersistentProcessing] Failed to cleanup video file: {cleanup_error}")
         
-        # Prepare final result
+        # Prepare final result with base64 video data and transcriptions
+        enhanced_clips = []
+        for i, clip_path in enumerate(generated_clips):
+            try:
+                # Read the actual video file and convert to base64 for frontend
+                with open(clip_path, 'rb') as video_file:
+                    video_bytes = video_file.read()
+                    import base64
+                    video_data = f"data:video/mp4;base64,{base64.b64encode(video_bytes).decode('utf-8')}"
+                
+                # Get clip info from viral moments
+                moment = viral_moments[i] if i < len(viral_moments) else {}
+                
+                # Extract individual clip transcription from viral segments
+                clip_transcription = ""
+                if moment.get('start_time') is not None and moment.get('duration') is not None:
+                    clip_start = moment.get('start_time', 0)
+                    clip_end = clip_start + moment.get('duration', 30)
+                    
+                    # Find the corresponding viral segment for this clip
+                    for segment in viral_segments:
+                        segment_start = segment.get('start', 0)
+                        segment_end = segment.get('end', 0)
+                        
+                        # Check if this segment overlaps with the clip timeframe
+                        if (segment_start <= clip_end and segment_end >= clip_start):
+                            clip_transcription += segment.get('text', '') + " "
+                    
+                    clip_transcription = clip_transcription.strip()
+                
+                # Fallback to segment_text if no transcription found
+                if not clip_transcription:
+                    clip_transcription = moment.get('segment_text', '')
+                
+                enhanced_clip = {
+                    'id': f"clip_{i+1}_{int(time.time())}",
+                    'clip_number': i + 1,
+                    'filename': os.path.basename(clip_path),
+                    'filepath': clip_path,
+                    'videoData': video_data,  # Base64 video data for frontend
+                    'download_url': f'/api/download/{os.path.basename(clip_path)}',
+                    'start_time': moment.get('start_time', 0),
+                    'end_time': moment.get('start_time', 0) + moment.get('duration', 30),
+                    'duration': moment.get('duration', 30),
+                    'viral_score': moment.get('viral_score', 8),
+                    'content_type': 'viral',
+                    'caption': moment.get('caption', f'Viral clip #{i+1} from {project_name}'),
+                    'hashtags': moment.get('hashtags', ['viral', 'trending', 'amazing']),
+                    'target_audience': 'general',
+                    'platforms': target_platforms,
+                    'segment_text': moment.get('segment_text', ''),
+                    'transcription': clip_transcription,  # Individual clip transcription
+                    'viral_potential': moment.get('viral_score', 8),
+                    'engagement': moment.get('viral_score', 8),
+                    'story_value': moment.get('viral_score', 8),
+                    'audio_impact': moment.get('viral_score', 8)
+                }
+                enhanced_clips.append(enhanced_clip)
+                
+            except Exception as e:
+                logger.error(f"❌ [PersistentProcessing] Error processing clip {i+1}: {e}")
+                # Add basic clip info even if base64 conversion fails
+                enhanced_clip = {
+                    'id': f"clip_{i+1}_{int(time.time())}",
+                    'clip_number': i + 1,
+                    'filename': os.path.basename(clip_path),
+                    'filepath': clip_path,
+                    'videoData': None,  # No video data available
+                    'download_url': f'/api/download/{os.path.basename(clip_path)}',
+                    'start_time': 0,
+                    'end_time': 30,
+                    'duration': 30,
+                    'viral_score': 8,
+                    'content_type': 'viral',
+                    'caption': f'Viral clip #{i+1} from {project_name}',
+                    'hashtags': ['viral', 'trending', 'amazing'],
+                    'target_audience': 'general',
+                    'platforms': target_platforms,
+                    'segment_text': '',
+                    'transcription': '',  # No transcription available
+                    'viral_potential': 8,
+                    'engagement': 8,
+                    'story_value': 8,
+                    'audio_impact': 8
+                }
+                enhanced_clips.append(enhanced_clip)
+        
         result = {
             'success': True,
             'message': f'Successfully generated {len(generated_clips)} clips',
             'clips_generated': len(generated_clips),
-            'clips': [
-                {
-                    'filename': os.path.basename(clip_path),
-                    'filepath': clip_path,
-                    'download_url': f'/api/download/{os.path.basename(clip_path)}'
-                } for clip_path in generated_clips
-            ],
-            'transcription': full_transcript,
+            'clips': enhanced_clips,
+            'transcription': full_transcript,  # Full video transcription
+            'fullVideoTranscription': full_transcript,  # Alternative name for compatibility
             'processing_options': processing_options,
             'project_name': project_name,
             'processing_time': time.time() - processing_state.get('start_time', time.time())
