@@ -412,26 +412,42 @@ def auto_resume_interrupted_processing():
                     logger.info(f"🔄 [AutoResume] Resuming interrupted processing: {processing_id}")
                     logger.info(f"📊 [AutoResume] Status: {status}, Step: {current_step}")
                     
-                    # Resume processing in a new thread
-                    import threading
-                    resume_thread = threading.Thread(
-                        target=process_video_persistent,
-                        args=(
-                            processing_id,
-                            state.get('video_path'),
-                            state.get('project_data', {}),
-                            state_file
-                        ),
-                        daemon=False
-                    )
-                    resume_thread.start()
-                    
-                    logger.info(f"🚀 [AutoResume] Resumed processing for ID: {processing_id}")
+                    # Check if the function exists before calling it
+                    if 'process_video_persistent' in globals():
+                        # Resume processing in a new thread
+                        import threading
+                        resume_thread = threading.Thread(
+                            target=process_video_persistent,
+                            args=(
+                                processing_id,
+                                state.get('video_path'),
+                                state.get('project_data', {}),
+                                state_file
+                            ),
+                            daemon=False
+                        )
+                        resume_thread.start()
+                        
+                        logger.info(f"🚀 [AutoResume] Resumed processing for ID: {processing_id}")
+                    else:
+                        logger.warning(f"⚠️ [AutoResume] process_video_persistent function not found, skipping: {processing_id}")
+                        # Clean up the state file
+                        try:
+                            os.remove(state_file)
+                            logger.info(f"🗑️ [AutoResume] Cleaned up orphaned state file: {state_file}")
+                        except:
+                            pass
                 else:
                     logger.info(f"⏭️ [AutoResume] Skipping {processing_id} (status: {status})")
                     
             except Exception as e:
                 logger.error(f"❌ [AutoResume] Error processing state file {state_file}: {e}")
+                # Clean up corrupted state file
+                try:
+                    os.remove(state_file)
+                    logger.info(f"🗑️ [AutoResume] Cleaned up corrupted state file: {state_file}")
+                except:
+                    pass
                 
     except Exception as e:
         logger.error(f"❌ [AutoResume] Error during auto-resume: {e}")
@@ -808,31 +824,21 @@ class FocusedVideoClipper:
                     logger.info(f"🧹 Cleaned up leftover temp file: {temp_file}")
                 except Exception:
                     pass
-            # Load audio with librosa and convert to mono 16kHz (fast upload/transcription)
-            audio_data, sample_rate = librosa.load(audio_file_path, sr=DEFAULT_AUDIO_SR, mono=True)
+            # OPTIMIZED: Load audio with lower sample rate for speed
+            audio_data, sample_rate = librosa.load(audio_file_path, sr=8000, mono=True)  # 8kHz instead of 16kHz for speed
             duration = len(audio_data) / sample_rate
             
             # Get original file size to calculate optimal chunk duration
             original_file_size = os.path.getsize(audio_file_path)
             logger.info(f"📊 Original file size: {original_file_size / (1024*1024):.2f} MB")
             
-            # Calculate target chunk duration based on file size
-            # Target ~0.8MB per chunk (post-compression) for ultra-fast processing
-            target_chunk_size_mb = CHUNK_TARGET_SIZE_MB
-            
-            # Estimate compression ratio based on file type and size
+            # OPTIMIZED: Use larger chunks to reduce API calls and processing time
             if original_file_size > 100 * 1024 * 1024:  # Large files (>100MB)
-                estimated_compression_ratio = 0.25  # More compression for large files
+                chunk_duration = 60  # 60 seconds (larger chunks)
             elif original_file_size > 50 * 1024 * 1024:  # Medium files (50-100MB)
-                estimated_compression_ratio = 0.3
+                chunk_duration = 90  # 90 seconds (larger chunks)
             else:  # Smaller files
-                estimated_compression_ratio = 0.4
-            
-            # Calculate target duration: (target_size / original_size) * duration / compression_ratio
-            target_chunk_duration = (target_chunk_size_mb * 1024 * 1024) / (original_file_size / duration) / estimated_compression_ratio
-
-            # Clamp between 8 seconds and 30 seconds for ultra-fast processing
-            chunk_duration = max(MIN_CHUNK_DURATION, min(MAX_CHUNK_DURATION, target_chunk_duration))
+                chunk_duration = 120  # 120 seconds (larger chunks)
             
             logger.info(f"🎯 Calculated chunk duration: {chunk_duration/60:.1f} minutes")
             
@@ -849,28 +855,33 @@ class FocusedVideoClipper:
                 end_sample = min((i + chunk_duration_int) * sample_rate, len(audio_data))
                 chunk_tasks.append((start_sample, end_sample, i))
             
-            # Process chunks in parallel
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(chunk_tasks), 8)) as executor:
-                future_to_chunk = {}
-                
-                for start_sample, end_sample, i in chunk_tasks:
-                    future = executor.submit(self._create_single_chunk, 
-                                          audio_data[start_sample:end_sample], 
-                                          i, chunk_count)
-                    future_to_chunk[future] = (start_sample, end_sample, i)
-                    chunk_count += 1
-                
-                # Collect results
-                for future in concurrent.futures.as_completed(future_to_chunk):
-                    try:
-                        chunk_path = future.result()
-                        if chunk_path:  # Skip None results (silent chunks)
-                            chunks.append(chunk_path)
-                    except Exception as e:
-                        logger.warning(f"⚠️ Chunk creation failed: {e}")
+            # OPTIMIZED: Process chunks sequentially for speed (no threading overhead)
+            for start_sample, end_sample, i in chunk_tasks:
+                try:
+                    chunk_data = audio_data[start_sample:end_sample]
+                    
+                    # Skip mostly-silent chunks to avoid unnecessary API calls
+                    if len(chunk_data) == 0:
                         continue
+                        
+                    mean_abs = float(np.mean(np.abs(chunk_data)))
+                    if mean_abs < 0.001 and len(chunk_data) > (sample_rate * 5):  # Skip very silent chunks
+                        logger.info(f"🔇 Skipping silent chunk {i}")
+                        continue
+                    
+                    # Create chunk file with faster processing
+                    chunk_path = os.path.join(TEMP_DIR, f"chunk_{i:03d}.wav")
+                    soundfile.write(chunk_path, chunk_data, sample_rate, format='WAV', subtype='PCM_16')
+                    
+                    file_size = os.path.getsize(chunk_path)
+                    logger.info(f"📦 Chunk {i} size: {file_size / (1024*1024):.2f} MB")
+                    chunks.append(chunk_path)
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ Chunk creation failed: {e}")
+                    continue
             
-            logger.info(f"✅ Created {len(chunks)} audio chunks with {chunk_duration:.1f}s duration each (mono {DEFAULT_AUDIO_SR//1000}kHz)")
+            logger.info(f"✅ Created {len(chunks)} OPTIMIZED audio chunks with {chunk_duration:.1f}s duration each (mono {sample_rate//1000}kHz)")
             return chunks
             
         except Exception as e:
@@ -925,24 +936,35 @@ class FocusedVideoClipper:
             return None
     
     def extract_audio_segments(self, video_path: str):
-        """Extract and analyze audio segments for viral content (same as original)"""
+        """Extract and analyze audio segments for viral content (OPTIMIZED for speed)"""
         try:
             logger.info("🎵 Extracting audio from video...")
             
-            # Extract audio from video (prefer mono 16kHz for speed)
+            # OPTIMIZED: Extract audio with minimal processing for maximum speed
             video = VideoFileClip(video_path)
             audio_path = "temp_audio.wav"
+            
+            # Get video duration for progress tracking
+            duration = video.duration
+            logger.info(f"📊 Video duration: {duration:.1f} seconds")
+            
             try:
+                # OPTIMIZED: Use minimal audio processing for speed
                 video.audio.write_audiofile(
                     audio_path,
-                    fps=DEFAULT_AUDIO_SR,
-                    nbytes=2,
+                    fps=8000,  # Lower sample rate for speed (8kHz instead of 16kHz)
+                    nbytes=1,  # 8-bit instead of 16-bit for speed
+                    codec='pcm_u8',  # Faster codec
                     verbose=False,
-                    logger=None
+                    logger=None,
+                    temp_audiofile='temp-audio.m4a'  # Use m4a for faster processing
                 )
-            except Exception:
+                logger.info("✅ Audio extracted with optimized settings")
+            except Exception as e:
+                logger.warning(f"⚠️ Optimized extraction failed, using fallback: {e}")
                 # Fallback to default parameters if not supported
                 video.audio.write_audiofile(audio_path, verbose=False, logger=None)
+            
             video.close()
             
             # Transcribe audio
