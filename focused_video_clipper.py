@@ -832,13 +832,15 @@ class FocusedVideoClipper:
             original_file_size = os.path.getsize(audio_file_path)
             logger.info(f"📊 Original file size: {original_file_size / (1024*1024):.2f} MB")
             
-            # OPTIMIZED: Use larger chunks to reduce API calls and processing time
-            if original_file_size > 100 * 1024 * 1024:  # Large files (>100MB)
-                chunk_duration = 60  # 60 seconds (larger chunks)
+            # OPTIMIZED: Use smaller chunks to prevent memory overflow and server restarts
+            if original_file_size > 200 * 1024 * 1024:  # Very large files (>200MB)
+                chunk_duration = 30  # 30 seconds (smaller chunks for memory safety)
+            elif original_file_size > 100 * 1024 * 1024:  # Large files (100-200MB)
+                chunk_duration = 45  # 45 seconds (smaller chunks)
             elif original_file_size > 50 * 1024 * 1024:  # Medium files (50-100MB)
-                chunk_duration = 90  # 90 seconds (larger chunks)
+                chunk_duration = 60  # 60 seconds (medium chunks)
             else:  # Smaller files
-                chunk_duration = 120  # 120 seconds (larger chunks)
+                chunk_duration = 90  # 90 seconds (larger chunks for small files)
             
             logger.info(f"🎯 Calculated chunk duration: {chunk_duration/60:.1f} minutes")
             
@@ -855,7 +857,7 @@ class FocusedVideoClipper:
                 end_sample = min((i + chunk_duration_int) * sample_rate, len(audio_data))
                 chunk_tasks.append((start_sample, end_sample, i))
             
-            # OPTIMIZED: Process chunks sequentially for speed (no threading overhead)
+            # OPTIMIZED: Process chunks sequentially with memory management
             for start_sample, end_sample, i in chunk_tasks:
                 try:
                     chunk_data = audio_data[start_sample:end_sample]
@@ -869,7 +871,7 @@ class FocusedVideoClipper:
                         logger.info(f"🔇 Skipping silent chunk {i}")
                         continue
                     
-                    # Create chunk file with faster processing
+                    # Create chunk file with faster processing and memory optimization
                     chunk_path = os.path.join(TEMP_DIR, f"chunk_{i:03d}.wav")
                     soundfile.write(chunk_path, chunk_data, sample_rate, format='WAV', subtype='PCM_16')
                     
@@ -877,11 +879,18 @@ class FocusedVideoClipper:
                     logger.info(f"📦 Chunk {i} size: {file_size / (1024*1024):.2f} MB")
                     chunks.append(chunk_path)
                     
+                    # Clear chunk data from memory immediately
+                    del chunk_data
+                    
                 except Exception as e:
                     logger.warning(f"⚠️ Chunk creation failed: {e}")
                     continue
             
             logger.info(f"✅ Created {len(chunks)} OPTIMIZED audio chunks with {chunk_duration:.1f}s duration each (mono {sample_rate//1000}kHz)")
+            
+            # Clear audio data from memory to prevent memory overflow
+            del audio_data
+            
             return chunks
             
         except Exception as e:
@@ -956,8 +965,7 @@ class FocusedVideoClipper:
                     nbytes=1,  # 8-bit instead of 16-bit for speed
                     codec='pcm_u8',  # Faster codec
                     verbose=False,
-                    logger=None,
-                    temp_audiofile='temp-audio.m4a'  # Use m4a for faster processing
+                    logger=None
                 )
                 logger.info("✅ Audio extracted with optimized settings")
             except Exception as e:
